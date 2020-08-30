@@ -17,9 +17,148 @@
 from gi.repository import Gtk
 import gettext
 import cairo
-
+from math import log
+import locale
 
 _ = gettext.gettext
+
+
+def scale(model, selection, factor):
+    """ Set the scale factor of a selection of pages """
+    changed = False
+    try:
+        width, height = factor
+    except TypeError:
+        width, height = None, None
+    for path in selection:
+        it = model.get_iter(path)
+        page = model.get_value(it, 0)
+        if width is None:
+            f = factor
+        else:
+            # TODO: allow to change aspect ratio
+            f = max(width / page.size[0], height / page.size[1])
+        if page.scale != f:
+            changed = True
+        page.scale = f
+        model.set_value(it, 0, page)
+    return changed
+
+
+class _LinkedSpinButton(Gtk.SpinButton):
+    """ A spin button which can be bound to an other button """
+
+    def __init__(self, minval, maxval, step, page=None):
+        Gtk.SpinButton.__init__(self)
+        self.set_digits(20)
+        self.set_width_chars(9)
+        self.connect('output', self.__output)
+        self.set_range(minval, maxval)
+        self.set_increments(step, step if page is None else page)
+        self.changing_from_brother = False
+
+    def __output(self, _user_data):
+        """ output signal handler to remove unneeded 0 """
+        s = locale.str(self.get_adjustment().get_value())
+        self.get_buffer().set_text(s, len(s))
+        return True
+
+    def connect_brother(self, brother, func):
+        """ Ensure a broher spinbutton have func(get_value()) value """
+        self.brother_func = func
+        self.connect('value-changed', self.__change_brother, brother)
+
+    @staticmethod
+    def __change_brother(self, brother):
+        if not self.changing_from_brother:
+            brother.changing_from_brother = True
+            brother.set_value(self.brother_func(self.get_value()))
+            brother.changing_from_brother = False
+
+
+class _RadioStackSwitcher(Gtk.VBox):
+    """ Same as GtkStackSwitcher but with radio button (i.e different semantic) """
+
+    def __init__(self, margin=12):
+        super().__init__()
+        self.set_spacing(margin)
+        self.props.margin = margin
+        self.radiogroup = []
+        self.stack = Gtk.Stack()
+        self.button_box = Gtk.HBox()
+        self.button_box.set_spacing(margin)
+        self.add(self.button_box)
+        self.add(self.stack)
+        self.selected_child = None
+
+    def add_named(self, child, name, title):
+        radio = Gtk.RadioButton.new_with_label(None, title)
+        if len(self.radiogroup) > 0:
+            radio.join_group(self.radiogroup[-1])
+        self.radiogroup.append(radio)
+        radio.set_hexpand(True)
+        radio.set_halign(Gtk.Align.CENTER)
+        radio.connect('toggled', self.__radio_handler, name)
+        self.button_box.add(radio)
+        self.stack.add_named(child, name)
+        if self.selected_child is None:
+            self.selected_child = child
+
+    def __radio_handler(self, button, name):
+        if button.props.active:
+            self.stack.set_visible_child_name(name)
+            self.selected_child = self.stack.get_child_by_name(name)
+
+
+class _RelativeScalingWidget(Gtk.HBox):
+    """ A form to specify the relative scaling factor """
+
+    def __init__(self, model, selection, margin=12):
+        super().__init__()
+        self.props.spacing = margin
+        self.add(Gtk.Label(label=_("Scale factor")))
+        self.entry = _LinkedSpinButton(0.01, 4.8e5, 1, 10)
+        self.entry.set_activates_default(True)
+        self.add(self.entry)
+        # A4 to A3 scaling factor is sqrt(2)
+        self.add(Gtk.Label(label=_("% = 2 power")))
+        entryp2 = _LinkedSpinButton(-13, 13, 0.5)
+        entryp2.set_snap_to_ticks(True)
+        self.add(entryp2)
+        self.entry.connect_brother(entryp2, lambda x: log(x / 100) / log(2))
+        entryp2.connect_brother(self.entry, lambda x: 100 * 2 ** x)
+        if selection:
+            pos = model.get_iter(selection[-1])
+            self.entry.set_value(model.get_value(pos, 0).scale * 100)
+
+    def get_value(self):
+        return self.entry.get_value() / 100
+
+
+class _AbsoluteScalingWidget(Gtk.HBox):
+    """ A form to specify the relative scaling factor """
+
+    def __init__(self, model, selection):
+        super().__init__()
+        self.add(Gtk.Label(label=_("Width")))
+        self.width_entry = _LinkedSpinButton(25.4, 5080, 1, 10)
+        self.add(self.width_entry)
+        self.add(Gtk.Label(label=_("mm")))
+        self.add(Gtk.Label(label=" " + _("Height")))
+        self.height_entry = _LinkedSpinButton(25.4, 5080, 1, 10)
+        self.add(self.height_entry)
+        self.add(Gtk.Label(label=_("mm")))
+        page = model.get_value(model.get_iter(selection[-1]), 0)
+        # A PDF unit is 1/72 inch
+        size = [page.scale * x * 25.4 / 72 for x in page.size]
+        self.width_entry.set_value(size[0])
+        self.height_entry.set_value(size[1])
+
+    def get_value(self):
+        return (
+            self.width_entry.get_value() / 25.4 * 72,
+            self.height_entry.get_value() / 25.4 * 72,
+        )
 
 
 class _CropWidget(Gtk.Frame):
@@ -84,11 +223,11 @@ class _CropWidget(Gtk.Frame):
 
 
 class Dialog(Gtk.Dialog):
-    """ A dialog box to define margins for page cropping """
+    """ A dialog box to define margins for page cropping and page size or scale factor """
 
     def __init__(self, model, selection, window):
         super().__init__(
-            title=(_('Crop Selected Pages')),
+            title=(_('Pages format')),
             parent=window,
             flags=Gtk.DialogFlags.MODAL,
             buttons=(
@@ -100,6 +239,15 @@ class Dialog(Gtk.Dialog):
         )
         self.set_default_response(Gtk.ResponseType.OK)
         self.set_resizable(False)
+        rel_widget = _RelativeScalingWidget(model, selection)
+        abs_widget = _AbsoluteScalingWidget(model, selection)
+        self.scale_stack = _RadioStackSwitcher()
+        self.scale_stack.add_named(rel_widget, "Relative", _("Relative"))
+        self.scale_stack.add_named(abs_widget, "Absolute", _("Absolute"))
+        pagesizeframe = Gtk.Frame(label=_('Pages Size'))
+        pagesizeframe.props.margin = 12
+        pagesizeframe.add(self.scale_stack)
+        self.vbox.pack_start(pagesizeframe, True, True, 0)
         self.crop_widget = _CropWidget(model, selection)
         self.vbox.pack_start(self.crop_widget, False, False, 0)
         self.show_all()
@@ -109,10 +257,12 @@ class Dialog(Gtk.Dialog):
         """ Open the dialog and return the crop value """
         result = self.run()
         crop = None
+        scale = None
         if result == Gtk.ResponseType.OK:
             crop = [self.crop_widget.get_crop()] * len(self.selection)
+            scale = self.scale_stack.selected_child.get_value()
         self.destroy()
-        return crop
+        return crop, scale
 
 
 def white_borders(model, selection, pdfqueue):
